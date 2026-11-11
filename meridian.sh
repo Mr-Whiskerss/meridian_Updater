@@ -17,7 +17,7 @@
 set -u
 set -o pipefail
 
-readonly MERIDIAN_VERSION="1.0.1"
+readonly MERIDIAN_VERSION="1.1.0"
 TS="$(date +%Y%m%d-%H%M%S)"; readonly TS
 HOST_SHORT="$(hostname -s 2>/dev/null || hostname)"; readonly HOST_SHORT
 readonly LOG_DIR="/var/log/meridian"
@@ -44,6 +44,7 @@ DO_REBOOT=0
 FORCE=0
 LVM_MIGRATE=0
 REMOVE_SDBOOT=0
+FIX_ALL=0                # --fix: apply every known safe fix without asking
 JSON_OUT=""
 
 # ---- run state -------------------------------------------------------------
@@ -60,6 +61,8 @@ P8_WARN=0
 P8_OUT=""
 P8_IDX=-1
 declare -a C_STATUS=() C_NAME=() C_DETAIL=()
+# Known fixes: sdboot | grub-removable | microcode
+declare -A FIX_OK=() FIX_ASKED=() FIX_DONE=()
 
 if [[ -t 1 ]]; then
   R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[36m'; D=$'\e[2m'; BOLD=$'\e[1m'; N=$'\e[0m'
@@ -96,9 +99,11 @@ Upgrade options:
   --ceph-repo TYPE        enterprise | no-subscription   (default: same as --repo)
   --non-interactive       Unattended apt run. Keeps your current config files and
                           lists any new maintainer versions for you to review.
+  --fix                   Apply the known safe fixes pve8to9 asks for, without asking:
+                          systemd-boot meta-package, GRUB removable EFI path,
+                          missing CPU microcode. (Interactive runs offer them anyway.)
+  --remove-systemd-boot   Only the systemd-boot fix (subset of --fix).
   --lvm-migrate           Run Proxmox's LVM autoactivation migration if pve8to9 asks.
-  --remove-systemd-boot   Remove the systemd-boot meta-package if pve8to9 asks
-                          (also clears that pve8to9 blocker before upgrading).
   --reboot                Reboot automatically once the upgrade succeeds.
   -y, --yes               Skip the type-the-node-name confirmation.
   --force                 Continue despite blocking pre-flight failures (not advised).
@@ -203,6 +208,29 @@ cluster_versions() {
   printf '%s' "${out% }"
 }
 
+# Every node must be on the latest 8.4 (or already 9) before any node moves to 9.
+check_cluster_peers() {
+  local pair n v
+  local -a behind=()
+  for pair in $1; do
+    n=${pair%%=*}; v=${pair#*=}
+    [[ "$n" == "$HOST_SHORT" || "$v" == "offline" || "$v" == "?" ]] && continue
+    ver_ge "$v" "8.4.1" || behind+=("${n} (${v})")
+  done
+  if (( ${#behind[@]} )); then
+    record WARN "Other cluster nodes" "${behind[*]} below 8.4 — Proxmox wants every node on the latest 8.4 before any node moves to 9; run apt update && apt dist-upgrade there first"
+  fi
+}
+
+check_two_node() {
+  local st nodes
+  st=$(timeout "$T_SHORT" pvecm status 2>/dev/null) || return 0
+  nodes=$(awk '/^Nodes:/ {print $2; exit}' <<<"$st")
+  if [[ "$nodes" == "2" ]] && ! grep -qi 'qdevice' <<<"$st"; then
+    record INFO "Two-node cluster" "while this node reboots the other loses quorum — once it is down, run 'pvecm expected 1' on the other node if you need to manage guests (a QDevice avoids this)"
+  fi
+}
+
 run_pve8to9() {
   local label="$1"
   P8_OUT="${LOG_DIR}/pve8to9-${label}-${HOST_SHORT}-${TS}.txt"
@@ -237,40 +265,183 @@ record_pve8to9() {
   P8_IDX=$(( ${#C_STATUS[@]} - 1 ))
 }
 
-# True if pve8to9 failed and every FAIL is the systemd-boot meta-package one,
-# which Meridian can fix itself with --remove-systemd-boot.
-p8_only_sdboot_fails() {
-  local total sd
-  [[ -f "$P8_OUT" && "$P8_FAIL" =~ ^[0-9]+$ ]] && (( P8_FAIL > 0 )) || return 1
-  total=$(grep -c '^FAIL:' "$P8_OUT")
-  sd=$(grep '^FAIL:' "$P8_OUT" | grep -ci 'systemd-boot')
-  (( total > 0 && total == sd ))
-}
-
-sdboot_hint() {
-  if pve8to9_mentions 'systemd-boot' && (( ! REMOVE_SDBOOT )); then
-    log "${Y}Fixable:${N} the systemd-boot blocker can be cleared by re-running with ${BOLD}--upgrade --remove-systemd-boot${N}"
-    log "         (or manually: apt remove systemd-boot). Keep it only if you set up systemd-boot yourself."
-  fi
-}
-
-# Remove the systemd-boot meta-package before the upgrade, then re-run pve8to9.
-fix_sdboot_preflight() {
-  section "Fixing pve8to9 blocker — systemd-boot meta-package"
-  local old_idx="$P8_IDX"
-  if ! apt-get remove -y systemd-boot 2>&1 | tee -a "$LOG_FILE"; then
-    record FAIL "systemd-boot meta-package" "removal failed — run: apt remove systemd-boot"; return 1
-  fi
-  record PASS "systemd-boot meta-package" "removed (systemd-boot-efi/-tools left in place for proxmox-boot-tool)"
-  C_STATUS[old_idx]="INFO"
-  C_DETAIL[old_idx]="resolved by --remove-systemd-boot (was: ${C_DETAIL[old_idx]})"
-  record_pve8to9 "pre-fixed"
-  [[ "$P8_FAIL" == "0" ]]
-}
-
 # Does the latest pve8to9 output raise a WARN/FAIL mentioning $1?
 pve8to9_mentions() {
   [[ -f "$P8_OUT" ]] && grep -E -A1 '^(WARN|FAIL):' "$P8_OUT" | grep -qi "$1"
+}
+
+# =============================================================================
+#  Known fixes — findings Meridian can resolve itself (with consent)
+# =============================================================================
+can_prompt() { (( ! NONINTERACTIVE && ! ASSUME_YES )) && [[ -r /dev/tty ]]; }
+
+fix_desc() {
+  case "$1" in
+    sdboot)         echo "systemd-boot meta-package — remove it (pve8to9 FAIL; systemd-boot-efi/-tools stay for proxmox-boot-tool)" ;;
+    grub-removable) echo "GRUB removable EFI path — let GRUB keep EFI/BOOT/BOOTX64.efi updated too" ;;
+    microcode)      echo "CPU microcode — install it (enables Debian's non-free-firmware component)" ;;
+  esac
+}
+
+# Fixable findings in the latest pve8to9 output, one per line.
+fixable_items() {
+  [[ -f "$P8_OUT" ]] || return 0
+  pve8to9_mentions 'systemd-boot meta-package' && echo sdboot
+  pve8to9_mentions 'Removable bootloader'      && echo grub-removable
+  pve8to9_mentions 'microcode'                 && echo microcode
+  return 0
+}
+
+# True if pve8to9 failed and every FAIL line is one Meridian has approval to fix.
+p8_fails_all_fixable() {
+  local other
+  [[ -f "$P8_OUT" && "$P8_FAIL" =~ ^[0-9]+$ ]] && (( P8_FAIL > 0 )) || return 1
+  [[ -n "${FIX_OK[sdboot]:-}" ]] || return 1
+  other=$(grep '^FAIL:' "$P8_OUT" | grep -vci 'systemd-boot')
+  (( other == 0 ))
+}
+
+# Decide which of the given fixes may be applied: --fix approves all,
+# --remove-systemd-boot approves sdboot, otherwise ask once per item (interactive).
+decide_fixes() {
+  local it ans
+  local -a new=()
+  for it in "$@"; do
+    [[ -n "${FIX_OK[$it]:-}" || -n "${FIX_ASKED[$it]:-}" ]] && continue
+    if (( FIX_ALL )) || { [[ "$it" == sdboot ]] && (( REMOVE_SDBOOT )); }; then
+      FIX_OK[$it]=1
+    else
+      new+=("$it")
+    fi
+  done
+  (( ${#new[@]} )) || return 0
+  for it in "${new[@]}"; do FIX_ASKED[$it]=1; done
+  can_prompt || return 0
+  log ""
+  log "${B}${BOLD}Meridian can fix these pve8to9 findings for you:${N}"
+  for it in "${new[@]}"; do log "  • $(fix_desc "$it")"; done
+  read -r -p "Apply these fixes? [Y/n] " ans </dev/tty || ans="n"
+  if [[ -z "$ans" || "$ans" =~ ^[Yy] ]]; then
+    for it in "${new[@]}"; do FIX_OK[$it]=1; done
+  fi
+  return 0
+}
+
+fixes_hint() {
+  local it
+  local -a pending=()
+  while read -r it; do
+    [[ -n "$it" && -z "${FIX_OK[$it]:-}" && -z "${FIX_DONE[$it]:-}" ]] && pending+=("$it")
+  done < <(fixable_items)
+  (( ${#pending[@]} )) || return 0
+  log "${Y}Fixable by Meridian:${N}"
+  for it in "${pending[@]}"; do log "  • $(fix_desc "$it")"; done
+  log "  Re-run with ${BOLD}--upgrade --fix${N}, or answer yes when --upgrade offers them."
+}
+
+fix_sdboot() {
+  local removes
+  # Simulate first: only ever remove the meta-package itself.
+  removes=$(apt-get -s remove systemd-boot 2>/dev/null | awk '/^Remv /{print $2}' | paste -sd ' ' -)
+  if [[ -z "$removes" ]]; then
+    record PASS "systemd-boot meta-package" "not installed"; return 0
+  fi
+  if [[ "$removes" != "systemd-boot" ]]; then
+    record FAIL "systemd-boot meta-package" "apt would also remove: ${removes} — left alone, check manually"; return 1
+  fi
+  if apt-get remove -y systemd-boot 2>&1 | tee -a "$LOG_FILE"; then
+    record PASS "systemd-boot meta-package" "removed (systemd-boot-efi/-tools kept for proxmox-boot-tool)"
+  else
+    record FAIL "systemd-boot meta-package" "removal failed — run: apt remove systemd-boot"; return 1
+  fi
+}
+
+fix_grub_removable() {
+  if ! pkg_installed grub-efi-amd64; then
+    record WARN "GRUB removable EFI path" "grub-efi-amd64 isn't installed (not GRUB on UEFI) — skipped, see ${P8_OUT}"; return 1
+  fi
+  echo 'grub-efi-amd64 grub2/force_efi_extra_removable boolean true' | debconf-set-selections -u
+  if apt-get install --reinstall -y grub-efi-amd64 2>&1 | tee -a "$LOG_FILE"; then
+    record PASS "GRUB removable EFI path" "GRUB now also keeps EFI/BOOT/BOOTX64.efi up to date"
+  else
+    record WARN "GRUB removable EFI path" "reinstalling grub-efi-amd64 failed — see ${LOG_FILE}"; return 1
+  fi
+}
+
+fix_microcode() {
+  local vendor pkg f tmp
+  vendor=$(awk -F': ' '/^vendor_id/ {print $2; exit}' /proc/cpuinfo 2>/dev/null)
+  case "$vendor" in
+    GenuineIntel) pkg="intel-microcode" ;;
+    AuthenticAMD) pkg="amd64-microcode" ;;
+    *) record WARN "CPU microcode" "unknown CPU vendor '${vendor:-?}' — skipped"; return 1 ;;
+  esac
+  if pkg_installed "$pkg"; then record PASS "CPU microcode" "${pkg} already installed"; return 0; fi
+
+  # Enable non-free-firmware on the Debian entries (one-line and deb822 formats).
+  if [[ -f /etc/apt/sources.list ]]; then
+    tmp=$(mktemp)
+    awk '/^[[:space:]]*deb(-src)?[[:space:]]/ && /debian\.org/ && !/non-free-firmware/ { $0 = $0 " non-free-firmware" } { print }' \
+      /etc/apt/sources.list >"$tmp" && cat "$tmp" >/etc/apt/sources.list
+    rm -f "$tmp"
+  fi
+  shopt -s nullglob
+  for f in "${SRC_D}"/*.sources; do
+    grep -q 'debian\.org' "$f" || continue
+    sed -i -E '/^[[:space:]]*Components:/{/non-free-firmware/! s/[[:space:]]*$/ non-free-firmware/}' "$f"
+  done
+  shopt -u nullglob
+
+  apt_update || { record WARN "CPU microcode" "apt update failed after enabling non-free-firmware — install ${pkg} manually"; return 1; }
+  if apt-get install -y "$pkg" 2>&1 | tee -a "$LOG_FILE"; then
+    record PASS "CPU microcode" "${pkg} installed — active after the reboot"
+  else
+    record WARN "CPU microcode" "installing ${pkg} failed — see ${LOG_FILE}"; return 1
+  fi
+}
+
+# Offer/apply known fixes for the latest pve8to9 run, then re-check if anything changed.
+maybe_apply_fixes() {
+  local label="$1" it applied=0 old_idx
+  local -a items=() todo=()
+  mapfile -t items < <(fixable_items)
+  (( ${#items[@]} )) || return 0
+  decide_fixes "${items[@]}"
+  for it in "${items[@]}"; do
+    [[ -n "${FIX_OK[$it]:-}" && -z "${FIX_DONE[$it]:-}" ]] && todo+=("$it")
+  done
+  if (( ${#todo[@]} )); then
+    section "Applying known fixes (${label})"
+    old_idx="$P8_IDX"
+    for it in "${todo[@]}"; do
+      case "$it" in
+        sdboot)         fix_sdboot ;;
+        grub-removable) fix_grub_removable ;;
+        microcode)      fix_microcode ;;
+      esac && { FIX_DONE[$it]=1; applied=1; }
+    done
+    if (( applied )); then
+      if (( old_idx >= 0 )); then
+        C_STATUS[old_idx]="INFO"
+        C_DETAIL[old_idx]="superseded by the re-check after fixes (was: ${C_DETAIL[old_idx]})"
+      fi
+      record_pve8to9 "${label}-fixed"
+    fi
+  fi
+  fixes_hint
+  return 0
+}
+
+# Newest installed Proxmox kernel (e.g. 7.0.14-28-pve).
+latest_pve_kernel() {
+  find /lib/modules -mindepth 1 -maxdepth 1 -type d -name '*-pve' -printf '%f\n' 2>/dev/null | sort -V | tail -n1
+}
+
+# pve-manager version recorded by the most recent Meridian backup (for --verify).
+last_backup_version() {
+  local f
+  f=$(find /root -maxdepth 2 -path '/root/meridian-backup-*/pveversion-before.txt' 2>/dev/null | sort | tail -n1)
+  [[ -n "$f" ]] && awk '/^pve-manager:/ {print $2; exit}' "$f"
 }
 
 detect_repo_choice() {
@@ -347,7 +518,11 @@ preflight() {
     else
       record FAIL "Cluster quorum" "not quorate — fix cluster health before upgrading"
     fi
-    if cv=$(cluster_versions) && [[ -n "$cv" ]]; then record INFO "Cluster node versions" "$cv"; fi
+    if cv=$(cluster_versions) && [[ -n "$cv" ]]; then
+      record INFO "Cluster node versions" "$cv"
+      check_cluster_peers "$cv"
+    fi
+    check_two_node
   else
     record INFO "Cluster" "standalone node"
   fi
@@ -400,10 +575,10 @@ preflight() {
   fi
   pt=$(grep -l '^hostpci' /etc/pve/qemu-server/*.conf 2>/dev/null | xargs -r -n1 basename | sed 's/\.conf$//' | paste -sd ',' -)
   if [[ -n "$pt" ]]; then
-    record WARN "PCI passthrough VMs" "VMID ${pt} — some passthrough setups break on kernel 6.14; be ready to pin the old kernel"
+    record WARN "PCI passthrough VMs" "VMID ${pt} — some passthrough setups break on the new PVE 9 kernel; be ready to pin the old one"
   fi
   if lsmod 2>/dev/null | grep -q '^nvidia'; then
-    record WARN "NVIDIA host driver" "must support kernel 6.14 (vGPU: GRID 18.3+); DKMS/.run installs need proxmox-headers and a rebuild after the upgrade"
+    record WARN "NVIDIA host driver" "must support the PVE 9 kernel (6.14 at 9.0, 7.0 by 9.2; vGPU: GRID 18.3+) — Meridian checks the DKMS build before you reboot"
   fi
   if [[ -f "$KEYRING" ]]; then
     record PASS "Proxmox archive keyring" "$KEYRING"
@@ -491,6 +666,7 @@ stage_latest_84() {
   fi
   record PASS "Latest 8.4 baseline" "now at ${pmv}"
   record_pve8to9 "after-8.4"
+  maybe_apply_fixes "after-8.4"
   if [[ "$P8_FAIL" != "0" ]] && (( ! FORCE )); then
     log "${R}pve8to9 still reports blockers — fix them and re-run Meridian.${N}"
     RESULT="blocked"; return 1
@@ -588,17 +764,6 @@ stage_repos() {
 }
 
 handle_pve8to9_hints() {
-  if pve8to9_mentions 'systemd-boot'; then
-    if (( REMOVE_SDBOOT )); then
-      if apt-get remove -y systemd-boot 2>&1 | tee -a "$LOG_FILE"; then
-        record PASS "systemd-boot meta-package" "removed as recommended by pve8to9"
-      else
-        record WARN "systemd-boot meta-package" "removal failed — run: apt remove systemd-boot"
-      fi
-    else
-      record WARN "systemd-boot meta-package" "pve8to9 recommends removing it — re-run with --remove-systemd-boot, or: apt remove systemd-boot"
-    fi
-  fi
   if pve8to9_mentions 'autoactivation'; then
     if (( LVM_MIGRATE )) && [[ -x "$LVM_MIGRATION" ]]; then
       if "$LVM_MIGRATION" 2>&1 | tee -a "$LOG_FILE"; then
@@ -657,7 +822,9 @@ stage_post() {
   fi
 
   record_pve8to9 "post"
+  maybe_apply_fixes "post"
   handle_pve8to9_hints
+  check_nvidia_dkms
 
   leftovers=$(find /etc -xdev \( -name '*.dpkg-dist' -o -name '*.ucf-dist' \) -newer "${BACKUP_DIR}/etc-apt.tgz" 2>/dev/null | paste -sd ',' -)
   if [[ -n "$leftovers" ]]; then
@@ -673,29 +840,47 @@ stage_post() {
   return 3
 }
 
+# An NVIDIA driver that isn't built for the new kernel means no GPU after the reboot.
+check_nvidia_dkms() {
+  local latest
+  lsmod 2>/dev/null | grep -q '^nvidia' || [[ -d /var/lib/dkms/nvidia ]] || return 0
+  latest=$(latest_pve_kernel)
+  if command -v dkms >/dev/null 2>&1 && dkms status 2>/dev/null | grep -i '^nvidia' | grep -F "$latest" | grep -q 'installed'; then
+    record PASS "NVIDIA DKMS module" "built for ${latest}"
+  elif command -v dkms >/dev/null 2>&1 && dkms status 2>/dev/null | grep -qi '^nvidia'; then
+    record WARN "NVIDIA DKMS module" "NOT built for ${latest} — before rebooting: apt install proxmox-headers-${latest} && dkms autoinstall -k ${latest}; if it won't build, use a driver that supports this kernel or pin the old one (proxmox-boot-tool kernel pin $(uname -r))"
+  else
+    record WARN "NVIDIA host driver" "loaded but not managed by DKMS — reinstall it for ${latest} after the reboot (GPU passthrough won't work until then)"
+  fi
+}
+
 do_upgrade() {
   local rc
   if [[ "$STATE" == "done" ]]; then
     log "Already on Proxmox VE 9 — running verification instead."
     verify; RESULT="already-upgraded"; return 0
   fi
-  local blockers sdfix=0
+  local blockers
+  local -a items=()
   blockers=$(count FAIL)
-  if (( REMOVE_SDBOOT )) && p8_only_sdboot_fails; then
-    sdfix=1; blockers=$(( blockers - 1 ))   # Meridian will fix this one itself
+  mapfile -t items < <(fixable_items)
+  (( ${#items[@]} )) && decide_fixes "${items[@]}"
+  if p8_fails_all_fixable; then
+    blockers=$(( blockers - 1 ))   # the pve8to9 FAIL is one Meridian will fix itself
   fi
   if (( blockers > 0 )) && (( ! FORCE )); then
     log ""
     log "${R}${blockers} blocking issue(s) found — fix them and re-run (or --force if you are certain).${N}"
-    sdboot_hint
+    fixes_hint
     RESULT="blocked"; return 1
   fi
   confirm
   backup_config
 
-  if (( sdfix )); then
-    if ! fix_sdboot_preflight && (( ! FORCE )); then
-      log "${R}pve8to9 still reports blockers after removing systemd-boot — see ${P8_OUT}${N}"
+  if (( ${#items[@]} )); then
+    maybe_apply_fixes "pre"
+    if [[ "$P8_FAIL" =~ ^[0-9]+$ ]] && (( P8_FAIL > 0 )) && (( ! FORCE )); then
+      log "${R}pve8to9 still reports blockers after the fixes — see ${P8_OUT}${N}"
       RESULT="blocked"; return 1
     fi
   fi
@@ -719,22 +904,31 @@ do_upgrade() {
 # =============================================================================
 verify() {
   section "Verification on ${HOST_SHORT}"
-  local pmv codename kver latest cv
+  local pmv codename kver latest cv remaining pair v
   pmv=$(pve_manager_version); codename=$(os_codename); kver=$(uname -r); PVE_AFTER="$pmv"
+  [[ -n "$PVE_BEFORE" && "$PVE_BEFORE" != "$pmv" ]] || PVE_BEFORE=$(last_backup_version)
 
   if ver_ge "$pmv" "9~" && [[ "$codename" == "trixie" ]]; then
+    STATE="done"
     record PASS "Proxmox VE version" "pve-manager ${pmv} on Debian ${codename}"
   else
+    STATE="incomplete"
     record FAIL "Proxmox VE version" "pve-manager ${pmv:-?} on Debian ${codename}"
   fi
 
-  latest=$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tail -n1)
+  latest=$(latest_pve_kernel)
   if [[ "$kver" != *-pve ]] || ! ver_ge "${kver%%-*}" "6.14"; then
     record WARN "Running kernel" "${kver} — reboot into the PVE 9 kernel"
   elif [[ -n "$latest" && "$latest" != "$kver" ]]; then
     record WARN "Running kernel" "${kver}, but ${latest} is installed — reboot pending (or a kernel is pinned)"
   else
     record PASS "Running kernel" "$kver"
+  fi
+
+  if lsmod 2>/dev/null | grep -q '^nvidia'; then
+    record PASS "NVIDIA driver" "loaded on ${kver}"
+  elif [[ -d /var/lib/dkms/nvidia ]]; then
+    record WARN "NVIDIA driver" "DKMS package present but the module isn't loaded — check: dkms status; nvidia-smi"
   fi
 
   if apt-cache policy 2>/dev/null | grep -q 'n=bookworm'; then
@@ -753,7 +947,14 @@ verify() {
     else
       record FAIL "Cluster quorum" "not quorate"
     fi
-    if cv=$(cluster_versions) && [[ -n "$cv" ]]; then record INFO "Cluster node versions" "$cv"; fi
+    if cv=$(cluster_versions) && [[ -n "$cv" ]]; then
+      record INFO "Cluster node versions" "$cv"
+      remaining=$(for pair in $cv; do v=${pair#*=}; [[ "$v" == "offline" ]] || ver_ge "$v" "9~" || printf '%s ' "$pair"; done)
+      if [[ -n "$remaining" ]]; then
+        record INFO "Next node" "still on PVE 8: ${remaining% } — upgrade one at a time, as with this one"
+      fi
+    fi
+    check_two_node
   fi
 
   record_pve8to9 "verify"
@@ -769,7 +970,14 @@ print_summary() {
   log "  Mode    : ${MODE}"
   log "  State   : ${STATE}"
   log "  Result  : ${BOLD}${RESULT}${N}"
-  log "  Version : ${PVE_BEFORE:-?} → ${PVE_AFTER:-n/a}"
+  local ver
+  if [[ -n "$PVE_BEFORE" && -n "$PVE_AFTER" && "$PVE_BEFORE" != "$PVE_AFTER" ]]; then
+    ver="${PVE_BEFORE} → ${PVE_AFTER}"
+  else
+    ver="${PVE_AFTER:-${PVE_BEFORE:-?}}"
+  fi
+  log "  Version : ${ver}"
+  (( ${#FIX_DONE[@]} )) && log "  Fixed   : ${!FIX_DONE[*]}"
   log "  Checks  : ${G}$(count PASS) pass${N} · ${Y}$(count WARN) warn${N} · ${R}$(count FAIL) fail${N} · ${B}$(count INFO) info${N}"
   if (( $(count WARN) + $(count FAIL) > 0 )); then
     log "  Needs attention:"
@@ -786,7 +994,7 @@ print_summary() {
 
 write_json() {
   [[ -n "$LOG_READY" && -n "$JSON_OUT" ]] || return 0
-  local i first=1 bdir=""
+  local i k first=1 bdir=""
   [[ -d "$BACKUP_DIR" ]] && bdir="$BACKUP_DIR"
   {
     printf '{\n'
@@ -795,6 +1003,7 @@ write_json() {
     printf '  "mode": "%s",\n  "state": "%s",\n  "result": "%s",\n' "$MODE" "$STATE" "$RESULT"
     printf '  "pve_before": "%s",\n  "pve_after": "%s",\n' "$(json_escape "$PVE_BEFORE")" "$(json_escape "$PVE_AFTER")"
     printf '  "repo": "%s",\n  "ceph_repo": "%s",\n' "$REPO_CHOICE" "$CEPH_REPO_CHOICE"
+    printf '  "fixes_applied": [%s],\n' "$(for k in "${!FIX_DONE[@]}"; do printf '"%s",' "$k"; done | sed 's/,$//')"
     printf '  "summary": {"pass": %d, "warn": %d, "fail": %d, "info": %d},\n' \
       "$(count PASS)" "$(count WARN)" "$(count FAIL)" "$(count INFO)"
     printf '  "checks": [\n'
@@ -823,6 +1032,7 @@ parse_args() {
       --non-interactive)     NONINTERACTIVE=1 ;;
       --lvm-migrate)         LVM_MIGRATE=1 ;;
       --remove-systemd-boot) REMOVE_SDBOOT=1 ;;
+      --fix|--fix-known)     FIX_ALL=1 ;;
       --reboot)              DO_REBOOT=1 ;;
       -y|--yes)              ASSUME_YES=1 ;;
       --force)               FORCE=1 ;;
@@ -837,7 +1047,7 @@ parse_args() {
     *) echo "--repo must be 'enterprise' or 'no-subscription'" >&2; exit 2 ;; esac
   case "$CEPH_REPO_CHOICE" in auto|enterprise|no-subscription) ;;
     *) echo "--ceph-repo must be 'enterprise' or 'no-subscription'" >&2; exit 2 ;; esac
-  if [[ "$MODE" != "upgrade" ]] && (( NONINTERACTIVE || LVM_MIGRATE || REMOVE_SDBOOT || DO_REBOOT || FORCE )); then
+  if [[ "$MODE" != "upgrade" ]] && (( NONINTERACTIVE || LVM_MIGRATE || REMOVE_SDBOOT || FIX_ALL || DO_REBOOT || FORCE )); then
     echo "Note: upgrade options are ignored outside --upgrade." >&2
   fi
 }
@@ -867,9 +1077,10 @@ main() {
         (( $(count FAIL) > 0 )) && rc=1
       elif (( $(count FAIL) > 0 )); then
         RESULT="blocked"; rc=1
-        sdboot_hint
+        fixes_hint
       else
         RESULT="ready"
+        fixes_hint
       fi
       ;;
     verify)
